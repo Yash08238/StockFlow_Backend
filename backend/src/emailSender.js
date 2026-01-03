@@ -2,14 +2,18 @@ require("dotenv").config();
 const nodemailer = require("nodemailer");
 
 // Create Brevo SMTP transporter (ONCE)
+// Use port 465 (secure) instead of 587 to avoid Railway blocking issues
 const transporter = nodemailer.createTransport({
   host: "smtp-relay.brevo.com",
-  port: 587,
-  secure: false,
+  port: 465,
+  secure: true,
   auth: {
     user: process.env.BREVO_SMTP_USER,
     pass: process.env.BREVO_SMTP_PASS,
   },
+  connectionTimeout: 10000, // 10 seconds
+  greetingTimeout: 10000,
+  socketTimeout: 30000, // 30 seconds
 });
 
 // Verify connection on startup

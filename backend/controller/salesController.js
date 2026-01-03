@@ -59,49 +59,20 @@ const salesController = {
       // ============ PHASE 2: PROCESS SALE ============
       const createdSales = [];
       const billProducts = [];
+      const bulkProductUpdates = [];
+      const bulkSalesInserts = [];
 
       for (const { product, quantity } of productData) {
-        const beforeState = product.toObject();
-
         // Deduct inventory
         product.inventory -= quantity;
 
         // Update lastSoldAt for dead stock tracking
         product.lastSoldAt = new Date();
 
-        // Recalculate dailySalesAvg (incremental update)
-        // Formula: new average considering this sale
-        const totalSalesForProduct = await Sales.countDocuments({
-          "product.productId": product._id,
-          owner: owner,
-        });
+        // Note: dailySalesAvg will be recalculated by cron job at 2:00 AM
+        // Skip expensive real-time calculation to improve performance
 
-        const totalQuantitySold = await Sales.aggregate([
-          { $match: { "product.productId": product._id, owner: owner } },
-          { $group: { _id: null, total: { $sum: "$quantity" } } },
-        ]);
-
-        const prevTotalQty = totalQuantitySold[0]?.total || 0;
-        const newTotalQty = prevTotalQty + quantity;
-
-        // Calculate days since first sale (or 1 if first sale)
-        const firstSale = await Sales.findOne({
-          "product.productId": product._id,
-          owner: owner,
-        }).sort({ date: 1 });
-
-        let daysSinceFirstSale = 1;
-        if (firstSale) {
-          daysSinceFirstSale = Math.max(
-            1,
-            Math.ceil((Date.now() - firstSale.date) / (1000 * 60 * 60 * 24))
-          );
-        }
-
-        product.dailySalesAvg = newTotalQty / daysSinceFirstSale;
-
-        await product.save();
-
+        
         // Calculate amount
         const price = product.price;
         const itemSubtotal = price * quantity;
@@ -109,8 +80,8 @@ const salesController = {
         const amount = itemSubtotal - discountAmount;
         const cp = product.cp || 0;
 
-        // Create sale record
-        const newSale = new Sales({
+        // Prepare sale record (don't save yet)
+        const newSale = {
           customer,
           customermail,
           owner,
@@ -125,45 +96,62 @@ const salesController = {
           subtotal: itemSubtotal,
           discount: discount,
           date: new Date(),
-        });
+          billStatus: "PENDING",
+        };
 
-        const savedSale = await newSale.save();
-        createdSales.push(savedSale);
+        bulkSalesInserts.push(newSale);
+        
+        // Store product reference for later processing
+        bulkProductUpdates.push(product);
 
-        // Audit log
-        await auditLogger.log(
-          owner,
-          "CREATE_SALE",
-          "sale",
-          savedSale._id,
-          null,
-          savedSale.toObject()
-        );
-
-        // Fetch product image for bill
-        const productImage = await ProductImage.findOne({
+        // Prepare bill data (we'll fetch images in bulk later)
+        billProducts.push({
+          ...newSale,
           productId: product._id,
         });
-
-        billProducts.push({
-          ...savedSale.toObject(),
-          image: productImage ? productImage.requestfile.imageUrl : null,
-        });
-
-        // ============ PHASE 3: TRIGGER NOTIFICATIONS ============
-        // Check low stock
-        await notificationService.checkLowStock(product, owner);
-
-        // Check forecast warning
-        await notificationService.checkForecast(product, owner);
       }
 
-      // Update user stats
-      await User.findByIdAndUpdate(owner, {
-        $inc: { "stats.totalSalesCreated": createdSales.length },
+      // Bulk save all products at once
+      await Promise.all(bulkProductUpdates.map(p => p.save()));
+
+      // Bulk insert all sales at once
+      const savedSales = await Sales.insertMany(bulkSalesInserts);
+      createdSales.push(...savedSales);
+
+      // Fetch all product images in one query
+      const productIds = bulkProductUpdates.map(p => p._id);
+      const productImages = await ProductImage.find({
+        productId: { $in: productIds }
       });
 
-      // ============ PHASE 4: GENERATE BILL PDF ============
+      // Create image lookup map
+      const imageMap = {};
+      productImages.forEach(img => {
+        imageMap[img.productId.toString()] = img.requestfile.imageUrl;
+      });
+
+      // Add images to bill products
+      billProducts.forEach(bp => {
+        bp.image = imageMap[bp.productId.toString()] || null;
+      });
+
+      // ============ PHASE 3: TRIGGER NOTIFICATIONS (async, non-blocking) ============
+      // Process notifications asynchronously without blocking response
+      Promise.all(
+        bulkProductUpdates.map(async (product) => {
+          await notificationService.checkLowStock(product, owner);
+          await notificationService.checkForecast(product, owner);
+        })
+      ).catch(err => console.error("Notification error:", err));
+
+      // Audit logs (async, non-blocking)
+      Promise.all(
+        savedSales.map(sale => 
+          auditLogger.log(owner, "CREATE_SALE", "sale", sale._id, null, sale.toObject())
+        )
+      ).catch(err => console.error("Audit log error:", err));
+
+      // ============ PHASE 4: GENERATE BILL PDF & UPLOAD ============
       const billData = {
         customerName: customer,
         customermail: customermail,
@@ -176,21 +164,12 @@ const salesController = {
         ),
       };
 
-      const fileName = `bill_${Date.now()}.pdf`;
-      const pdfFilePath = path.join(__dirname, "../pdfs", fileName);
-
-      // Ensure pdfs directory exists
-      if (!fs.existsSync(path.join(__dirname, "../pdfs"))) {
-        fs.mkdirSync(path.join(__dirname, "../pdfs"), { recursive: true });
-      }
-
-      // Generate PDF in memory
       const pdfBuffer = await generateBillPDF(billData);
       console.log(`📄 Generated PDF Buffer: ${pdfBuffer.length} bytes`);
 
       let pdfUrl = null;
 
-      // 1. Cloudinary Upload
+      // Upload to Cloudinary
       try {
         const uploadResult = await cloudinaryUpload.uploadFromBuffer(
           pdfBuffer,
@@ -198,39 +177,33 @@ const salesController = {
         );
         pdfUrl = uploadResult.secure_url;
 
-        // Update sales with PDF URL and success status
-        for (const sale of createdSales) {
-          console.log("✅ PDF Generated & Uploaded:", pdfUrl);
-          sale.pdfUrl = pdfUrl;
-          sale.billStatus = "GENERATED";
-          await sale.save();
-        }
-      } catch (uploadError) {
-        console.error(
-          "❌ Cloudinary Upload Error (Bill URL won't be saved):",
-          uploadError.message
+        // Update all sales with PDF URL (bulk update)
+        await Sales.updateMany(
+          { _id: { $in: createdSales.map(s => s._id) } },
+          { $set: { pdfUrl: pdfUrl, billStatus: "GENERATED" } }
         );
-        for (const sale of createdSales) {
-          sale.billStatus = "FAILED";
-          await sale.save();
-        }
+        console.log("✅ PDF Generated & Uploaded:", pdfUrl);
+      } catch (uploadError) {
+        console.error("❌ Cloudinary Upload Error:", uploadError.message);
+        await Sales.updateMany(
+          { _id: { $in: createdSales.map(s => s._id) } },
+          { $set: { billStatus: "FAILED" } }
+        );
       }
 
-      // ============ PHASE 5: SEND EMAIL WITH ATTACHMENT ============
-      // 2. Send Email
+      // ============ PHASE 5: SEND EMAIL (async, non-blocking) ============
       const emailSubject = "Your Purchase Receipt - StockFlow ERP";
       const emailBody = `Dear ${customer},\n\nThank you for your purchase!\n\nPlease find your bill attached to this email.\n\nIf you have any questions, please don't hesitate to contact us.\n\nBest regards,\nStockFlow ERP`;
 
-      try {
-        console.log("📧 Attempting to send email to:", customermail);
-        // Pass buffer as attachment
-        await sendEmail(customermail, emailSubject, emailBody, pdfBuffer);
-        console.log("✅ Email sent successfully to", customermail);
-      } catch (emailError) {
-        console.error("❌ Email sending failed:", emailError.message);
-      }
+      // Send email asynchronously without blocking response
+      sendEmail(customermail, emailSubject, emailBody, pdfBuffer)
+        .then(() => console.log("✅ Email sent successfully to", customermail))
+        .catch(err => console.error("❌ Email sending failed:", err.message));
 
-      // 3. Cleanup (No file cleanup needed)
+      // Update user stats (async)
+      User.findByIdAndUpdate(owner, {
+        $inc: { "stats.totalSalesCreated": createdSales.length },
+      }).catch(err => console.error("Stats update error:", err));
 
       successResponse(
         res,
