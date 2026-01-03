@@ -3,6 +3,8 @@ const express = require("express");
 const cors = require("cors");
 const morgan = require("morgan");
 
+const config = require("./config/config");
+
 // Initialize email sender (verifies SMTP on startup)
 require("./src/emailSender");
 
@@ -10,10 +12,9 @@ require("./src/emailSender");
 const app = express();
 
 // Middleware
-// Middleware
 app.use(
   cors({
-    origin: process.env.FRONTEND_URL || "http://localhost:5173",
+    origin: config.frontendUrl || "http://localhost:5173", // Use config, fallback for dev
     credentials: true,
   })
 );
@@ -65,7 +66,7 @@ app.get("/health", (req, res) => {
 
 // Root endpoint
 app.get("/", (req, res) => {
-  res.json({ message: "StockFlow ERP Backend API", version: "1.0.0" });
+  res.send("Backend is running");
 });
 
 // 404 handler
@@ -82,9 +83,9 @@ app.use((err, req, res, next) => {
 });
 
 // Start server
-const port = process.env.PORT || 3000;
+const port = config.port || 5000;
 app.listen(port, () => {
-  console.log(`Server is running on http://localhost:${port}`);
+  console.log("Server running on port " + port);
 });
 
 module.exports = app;
